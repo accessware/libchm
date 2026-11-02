@@ -68,6 +68,18 @@ pub struct Decompressor {
 	compressed: Vec<u8>,
 }
 
+/// How many blocks pass between LZX resets, which is never zero.
+///
+/// The reset interval alone says this. chmlib derives it from the window size and
+/// `windows_per_reset` instead, which agrees only while `windows_per_reset` is half the window
+/// in blocks, and files exist where it is not (reset and window 8 blocks, 8 per reset).
+fn blocks_between_resets(reset_interval: u32, block_len: u64) -> Result<u64> {
+	match u64::from(reset_interval).checked_div(block_len) {
+		None | Some(0) => Err(ChmError::BadResetTable),
+		Some(blocks) => Ok(blocks),
+	}
+}
+
 impl Decompressor {
 	/// Build a decompressor for the `MSCompressed` section.
 	///
@@ -90,11 +102,7 @@ impl Decompressor {
 		if reset_table.block_len > u64::from(ctl.window_size) {
 			return Err(ChmError::BadResetTable);
 		}
-		// `parse_lzxc_control_data` guarantees the division is at least one, so the reset
-		// interval this yields is non-zero and safe to use as a divisor.
-		let reset_blkcount =
-			u64::from(ctl.reset_interval / (ctl.window_size / 2)).saturating_mul(u64::from(ctl.windows_per_reset));
-		debug_assert!(reset_blkcount > 0);
+		let reset_blkcount = blocks_between_resets(ctl.reset_interval, reset_table.block_len)?;
 		// Keeping the compressed stream inside the file bounds every per-block read below
 		// by a length the file can actually back.
 		let cn_abs_start = data_offset + cn_unit_start;
@@ -230,6 +238,21 @@ mod tests {
 	#![allow(clippy::cast_possible_truncation)]
 
 	use super::*;
+
+	// Each row is a control data layout seen in real files, in units of one 0x8000 byte block.
+	#[test]
+	fn resets_fall_every_reset_interval_whatever_the_window() {
+		const BLOCK: u32 = 0x8000;
+		for (reset, blocks) in [(2, 2), (4, 4), (8, 8), (64, 64)] {
+			assert_eq!(blocks_between_resets(reset * BLOCK, u64::from(BLOCK)).unwrap(), blocks);
+		}
+	}
+
+	#[test]
+	fn an_interval_shorter_than_a_block_is_refused() {
+		assert!(matches!(blocks_between_resets(0x4000, 0x8000), Err(ChmError::BadResetTable)));
+		assert!(matches!(blocks_between_resets(0x8000, 0), Err(ChmError::BadResetTable)));
+	}
 
 	#[test]
 	fn cache_maps_blocks_to_slots_by_modulus() {

@@ -80,7 +80,6 @@ pub struct LzxcResetTable {
 pub struct LzxcControlData {
 	pub reset_interval: u32,
 	pub window_size: u32,
-	pub windows_per_reset: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -197,24 +196,18 @@ pub fn parse_lzxc_control_data(buf: &[u8]) -> Result<LzxcControlData> {
 	let version = u32_le(buf, 8);
 	let mut reset_interval = u32_le(buf, 0x0c);
 	let mut window_size = u32_le(buf, 0x10);
-	let windows_per_reset = u32_le(buf, 0x14);
 	// Version 2 stores both fields in 0x8000-byte units.
 	if version == 2 {
 		reset_interval = reset_interval.saturating_mul(0x8000);
 		window_size = window_size.saturating_mul(0x8000);
 	}
-	if window_size == 0 || reset_interval == 0 || windows_per_reset == 0 {
+	if window_size == 0 || reset_interval == 0 {
 		return Err(ChmError::BadLzxc);
 	}
 	if !window_size.is_power_of_two() {
 		return Err(ChmError::BadLzxc);
 	}
-	// Guarantees `reset_interval / (window_size / 2) >= 1`, so the reset block count the
-	// decompressor derives from these fields can never be zero.
-	if !reset_interval.is_multiple_of(window_size / 2) {
-		return Err(ChmError::BadLzxc);
-	}
-	Ok(LzxcControlData { reset_interval, window_size, windows_per_reset })
+	Ok(LzxcControlData { reset_interval, window_size })
 }
 
 /// Parse one cword from `buf` starting at byte index `offset`. Returns `(value, new_offset)`.
@@ -415,7 +408,6 @@ mod tests {
 		let ctl = parse_lzxc_control_data(&lzxc_control(2, 2, 2, 1)).unwrap();
 		assert_eq!(ctl.reset_interval, 0x10000);
 		assert_eq!(ctl.window_size, 0x10000);
-		assert_eq!(ctl.windows_per_reset, 1);
 	}
 
 	#[test]
@@ -427,13 +419,6 @@ mod tests {
 	fn lzxc_rejects_zero_fields() {
 		assert!(matches!(parse_lzxc_control_data(&lzxc_control(1, 0, 0x10000, 1)), Err(ChmError::BadLzxc)));
 		assert!(matches!(parse_lzxc_control_data(&lzxc_control(1, 0x8000, 0, 1)), Err(ChmError::BadLzxc)));
-		assert!(matches!(parse_lzxc_control_data(&lzxc_control(1, 0x8000, 0x10000, 0)), Err(ChmError::BadLzxc)));
-	}
-
-	#[test]
-	fn lzxc_reset_interval_must_divide_half_window() {
-		// 0x9000 is not a multiple of 0x10000 / 2, which would give a zero reset count.
-		assert!(matches!(parse_lzxc_control_data(&lzxc_control(1, 0x9000, 0x10000, 1)), Err(ChmError::BadLzxc)));
 	}
 
 	#[test]
