@@ -3,6 +3,7 @@
 
 use std::{
 	cmp::Ordering,
+	collections::HashSet,
 	fs::File,
 	io::{Read, Seek, SeekFrom},
 };
@@ -248,7 +249,13 @@ impl Directory {
 		let mut entries = Vec::new();
 		let mut buf = vec![0u8; self.block_len];
 		let mut cur = self.index_head;
+		let mut seen = HashSet::new();
 		while cur >= 0 {
+			// Leaf blocks are chained in key order, which needn't be file order, so only a
+			// block coming round again shows that a corrupt `block_next` would loop forever.
+			if !seen.insert(cur) {
+				return Err(ChmError::BadPmgl);
+			}
 			self.fetch_block(file, cur, &mut buf)?;
 			let header = parse_pmgl(&buf)?;
 			let end = self.used_end(header.free_space, ChmError::BadPmgl)?;
@@ -264,11 +271,6 @@ impl Directory {
 					entries.push(entry);
 				}
 			}
-			// Leaf blocks are chained in file order. Requiring the chain to advance keeps
-			// a corrupt `block_next` from looping forever.
-			if header.block_next >= 0 && header.block_next <= cur {
-				return Err(ChmError::BadPmgl);
-			}
 			cur = header.block_next;
 		}
 		Ok(entries)
@@ -277,7 +279,52 @@ impl Directory {
 
 #[cfg(test)]
 mod tests {
+	use std::io::Write as _;
+
 	use super::*;
+
+	const BLOCK_LEN: usize = 64;
+
+	/// One leaf block holding a single file entry, chained to `next`.
+	fn leaf(name: &str, next: i32) -> Vec<u8> {
+		let mut block = vec![0u8; BLOCK_LEN];
+		block[..4].copy_from_slice(b"PMGL");
+		let mut entry = vec![u8::try_from(name.len()).unwrap()];
+		entry.extend_from_slice(name.as_bytes());
+		// Space, start, and length, each a one byte encoded integer.
+		entry.extend_from_slice(&[0, 0, 0]);
+		let free = BLOCK_LEN - PMGL_HEADER_LEN - entry.len();
+		block[4..8].copy_from_slice(&u32::try_from(free).unwrap().to_le_bytes());
+		block[0x10..0x14].copy_from_slice(&next.to_le_bytes());
+		block[PMGL_HEADER_LEN..PMGL_HEADER_LEN + entry.len()].copy_from_slice(&entry);
+		block
+	}
+
+	/// Enumerate leaf blocks written to a real file, since that is what `enumerate` reads.
+	fn enumerate_blocks(test: &str, blocks: &[Vec<u8>]) -> Result<Vec<String>> {
+		let path = std::env::temp_dir().join(format!("libchm-{test}-{}.bin", std::process::id()));
+		let mut file = File::create(&path).unwrap();
+		file.write_all(&blocks.concat()).unwrap();
+		drop(file);
+		let dir = Directory { dir_offset: 0, block_len: BLOCK_LEN, index_root: 0, index_head: 0 };
+		let result = dir.enumerate(&mut File::open(&path).unwrap(), None, EntrySel::ALL);
+		std::fs::remove_file(&path).unwrap();
+		result.map(|entries| entries.into_iter().map(|entry| entry.path).collect())
+	}
+
+	// HTML Help Workshop splits a full leaf by moving its upper half to a new block at the end
+	// of the directory, so key order can run backwards through the file.
+	#[test]
+	fn a_leaf_chain_may_run_out_of_file_order() {
+		let blocks = [leaf("/a", 2), leaf("/c", -1), leaf("/b", 1)];
+		assert_eq!(enumerate_blocks("order", &blocks).unwrap(), ["/a", "/b", "/c"]);
+	}
+
+	#[test]
+	fn a_leaf_chain_that_loops_is_refused() {
+		let blocks = [leaf("/a", 1), leaf("/b", 0)];
+		assert!(matches!(enumerate_blocks("loop", &blocks), Err(ChmError::BadPmgl)));
+	}
 
 	#[test]
 	fn categories_follow_the_path_prefix() {
